@@ -1163,6 +1163,19 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
                         await reader.NextResultAsync(cancellationToken);
                     else
                         reader.NextResult();
+
+                    // Do not consider dereferencing if no returned columns are cursors, but if just some are cursors
+                    // then follow the pre-existing convention set by the Oracle drivers and dereference what we can.
+                    // (The rest of the pattern is that we only ever try to dereference on Query and Scalar, never on Execute.)
+                    if (connector.Settings.DereferenceCursors && NpgsqlDereferencingReader.CanDereference(reader))
+                    {
+                        // Passes <see cref="CommandBehavior"/> to dereferencing reader, which uses it where it can
+                        // (e.g. to dereference only the first cursor, or only the first row of the first cursor)
+                        var newReader = new NpgsqlDereferencingReader(reader, behavior, connector);
+                        await newReader.Init(async, cancellationToken);
+                        return newReader;
+                    }
+
                     return reader;
                 }
             }

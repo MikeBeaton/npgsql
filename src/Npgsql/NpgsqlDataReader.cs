@@ -29,13 +29,12 @@ namespace Npgsql
     /// Reads a forward-only stream of rows from a data source.
     /// </summary>
 #pragma warning disable CA1010
-    public sealed class NpgsqlDataReader : DbDataReader
+    public class NpgsqlStandardDataReader : NpgsqlDataReader
 #pragma warning restore CA1010
 #if !NET461
         , IDbColumnSchemaGenerator
 #endif
     {
-        internal NpgsqlCommand Command { get; private set; } = default!;
         internal NpgsqlConnector Connector { get; }
         NpgsqlConnection _connection = default!;
 
@@ -109,7 +108,7 @@ namespace Npgsql
         /// <summary>
         /// Is raised whenever Close() is called.
         /// </summary>
-        public event EventHandler? ReaderClosed;
+        public override event EventHandler? ReaderClosed;
 
         bool _isSchemaOnly;
         bool _isSequential;
@@ -124,9 +123,9 @@ namespace Npgsql
         /// </summary>
         char[]? _tempCharBuf;
 
-        static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlDataReader));
+        static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlStandardDataReader));
 
-        internal NpgsqlDataReader(NpgsqlConnector connector)
+        internal NpgsqlStandardDataReader(NpgsqlConnector connector)
         {
             Connector = connector;
         }
@@ -699,10 +698,10 @@ namespace Npgsql
         /// traverses the result.
         ///
         /// For commands with multiple queries, this exposes the number of rows affected on
-        /// a statement-by-statement basis, unlike <see cref="NpgsqlDataReader.RecordsAffected"/>
+        /// a statement-by-statement basis, unlike <see cref="DbDataReader.RecordsAffected"/>
         /// which exposes an aggregation across all statements.
         /// </remarks>
-        public IReadOnlyList<NpgsqlStatement> Statements => _statements.AsReadOnly();
+        public override IReadOnlyList<NpgsqlStatement> Statements => _statements.AsReadOnly();
 
         /// <summary>
         /// Gets a value that indicates whether this DbDataReader contains one or more rows.
@@ -719,7 +718,7 @@ namespace Npgsql
         /// has been called
         /// </summary>
         [PublicAPI]
-        public bool IsOnRow => State == ReaderState.InResult;
+        public override bool IsOnRow => State == ReaderState.InResult;
 
         /// <summary>
         /// Gets the name of the column, given the zero-based column ordinal.
@@ -756,38 +755,7 @@ namespace Npgsql
                 while (await NextResult(async, true)) {}
         }
 
-        /// <summary>
-        /// Releases the resources used by the <see cref="NpgsqlDataReader">NpgsqlDataReader</see>.
-        /// </summary>
-        protected override void Dispose(bool disposing) => Close();
-
-#if !NET461 && !NETSTANDARD2_0
-        /// <summary>
-        /// Releases the resources used by the <see cref="NpgsqlDataReader">NpgsqlDataReader</see>.
-        /// </summary>
-        public override ValueTask DisposeAsync()
-        {
-            using (NoSynchronizationContextScope.Enter())
-                return new ValueTask(Close(connectionClosing: false, async: true));
-        }
-#endif
-
-        /// <summary>
-        /// Closes the <see cref="NpgsqlDataReader"/> reader, allowing a new command to be executed.
-        /// </summary>
-        public override void Close() => Close(connectionClosing: false, async: false).GetAwaiter().GetResult();
-
-        /// <summary>
-        /// Closes the <see cref="NpgsqlDataReader"/> reader, allowing a new command to be executed.
-        /// </summary>
-#if !NET461 && !NETSTANDARD2_0
-        public override Task CloseAsync()
-#else
-        public Task CloseAsync()
-#endif
-            => Close(connectionClosing: false, async: true);
-
-        internal async Task Close(bool connectionClosing, bool async)
+        internal override async Task Close(bool connectionClosing, bool async)
         {
             if (State == ReaderState.Closed)
                 return;
@@ -811,7 +779,7 @@ namespace Npgsql
             await Cleanup(async, connectionClosing);
         }
 
-        internal async Task Cleanup(bool async, bool connectionClosing=false)
+        internal override async Task Cleanup(bool async, bool connectionClosing=false)
         {
             Log.Trace("Cleaning up reader", Connector.Id);
 
@@ -969,7 +937,7 @@ namespace Npgsql
         /// </remarks>
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <returns>The value of the specified column.</returns>
-        public NpgsqlDate GetDate(int ordinal) => GetFieldValue<NpgsqlDate>(ordinal);
+        public override NpgsqlDate GetDate(int ordinal) => GetFieldValue<NpgsqlDate>(ordinal);
 
         /// <summary>
         /// Gets the value of the specified column as a TimeSpan,
@@ -982,7 +950,7 @@ namespace Npgsql
         /// </remarks>
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <returns>The value of the specified column.</returns>
-        public TimeSpan GetTimeSpan(int ordinal) => GetFieldValue<TimeSpan>(ordinal);
+        public override TimeSpan GetTimeSpan(int ordinal) => GetFieldValue<TimeSpan>(ordinal);
 
         /// <summary>
         /// Gets the value of the specified column as an <see cref="NpgsqlTimeSpan"/>,
@@ -999,7 +967,7 @@ namespace Npgsql
         /// </remarks>
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <returns>The value of the specified column.</returns>
-        public NpgsqlTimeSpan GetInterval(int ordinal) => GetFieldValue<NpgsqlTimeSpan>(ordinal);
+        public override NpgsqlTimeSpan GetInterval(int ordinal) => GetFieldValue<NpgsqlTimeSpan>(ordinal);
 
         /// <summary>
         /// Gets the value of the specified column as an <see cref="NpgsqlDateTime"/>,
@@ -1016,7 +984,7 @@ namespace Npgsql
         /// </remarks>
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <returns>The value of the specified column.</returns>
-        public NpgsqlDateTime GetTimeStamp(int ordinal) => GetFieldValue<NpgsqlDateTime>(ordinal);
+        public override NpgsqlDateTime GetTimeStamp(int ordinal) => GetFieldValue<NpgsqlDateTime>(ordinal);
 
         #endregion
 
@@ -1084,7 +1052,7 @@ namespace Npgsql
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <param name="cancellationToken">The token to monitor for cancellation requests. The default value is <see cref="CancellationToken.None"/>.</param>
         /// <returns>The returned object.</returns>
-        public Task<Stream> GetStreamAsync(int ordinal, CancellationToken cancellationToken = default)
+        public override Task<Stream> GetStreamAsync(int ordinal, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled<Stream>(cancellationToken);
@@ -1255,7 +1223,7 @@ namespace Npgsql
         /// <param name="ordinal">The zero-based column ordinal.</param>
         /// <param name="cancellationToken">The token to monitor for cancellation requests. The default value is <see cref="CancellationToken.None"/>.</param>
         /// <returns>The returned object.</returns>
-        public Task<TextReader> GetTextReaderAsync(int ordinal, CancellationToken cancellationToken = default)
+        public override Task<TextReader> GetTextReaderAsync(int ordinal, CancellationToken cancellationToken = default)
         {
             if (cancellationToken.IsCancellationRequested)
                 return Task.FromCanceled<TextReader>(cancellationToken);
@@ -1570,7 +1538,7 @@ namespace Npgsql
         /// </summary>
         /// <param name="ordinal">The zero-based column index.</param>
         [PublicAPI]
-        public PostgresType GetPostgresType(int ordinal) => CheckRowDescriptionAndGetField(ordinal).PostgresType;
+        public override PostgresType GetPostgresType(int ordinal) => CheckRowDescriptionAndGetField(ordinal).PostgresType;
 
         /// <summary>
         /// Gets the data type information for the specified field.
@@ -1588,7 +1556,7 @@ namespace Npgsql
         /// debugging purposes.
         /// </remarks>
         /// <param name="ordinal">The zero-based column index.</param>
-        public uint GetDataTypeOID(int ordinal) => CheckRowDescriptionAndGetField(ordinal).TypeOID;
+        public override uint GetDataTypeOID(int ordinal) => CheckRowDescriptionAndGetField(ordinal).TypeOID;
 
         /// <summary>
         /// Gets the data type of the specified column.
@@ -1639,7 +1607,7 @@ namespace Npgsql
         /// Returns schema information for the columns in the current resultset.
         /// </summary>
         /// <returns></returns>
-        public ReadOnlyCollection<NpgsqlDbColumn> GetColumnSchema()
+        public override ReadOnlyCollection<NpgsqlDbColumn> GetColumnSchema()
             => RowDescription == null || RowDescription.Fields.Count == 0
                 ? new List<NpgsqlDbColumn>().AsReadOnly()
                 : new DbColumnSchemaGenerator(_connection, RowDescription, _behavior.HasFlag(CommandBehavior.KeyInfo))
