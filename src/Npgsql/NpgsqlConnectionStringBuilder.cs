@@ -881,14 +881,14 @@ namespace Npgsql
         #region Properties - Cursor Dereferencing
 
         /// <summary>
-        /// Whether to automatically dereference cursor only result sets. If enabled the data reader returns the results the
+        /// Whether to automatically dereference cursor result sets. If enabled the data reader returns the results which the
         /// cursors refer to instead of the cursors themselves.
         /// </summary>
         [Category("Cursor Dereferencing")]
-        [Description("Whether to automatically dereference cursor only result sets. If enabled the data reader returns the results the cursors refer to instead of the cursors themselves.")]
+        [Description("Whether to automatically dereference cursor result sets. If enabled the data reader returns the results which the cursors refer to instead of the cursors themselves.")]
         [DisplayName("Dereference Cursors")]
         [NpgsqlConnectionStringProperty]
-        [DefaultValue(false)]
+        [DefaultValue(true)] ///////////// - false !
         public bool DereferenceCursors
         {
             get => _dereferenceCursors;

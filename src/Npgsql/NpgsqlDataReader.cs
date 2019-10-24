@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
@@ -31,11 +31,7 @@ namespace Npgsql
 #pragma warning disable CA1010
     public class NpgsqlStandardDataReader : NpgsqlDataReader
 #pragma warning restore CA1010
-#if !NET461
-        , IDbColumnSchemaGenerator
-#endif
     {
-        internal NpgsqlConnector Connector { get; }
         NpgsqlConnection _connection = default!;
 
         /// <summary>
@@ -45,14 +41,7 @@ namespace Npgsql
 
         Task _sendTask = default!;
 
-        internal ReaderState State;
-
         internal NpgsqlReadBuffer Buffer = default!;
-
-        /// <summary>
-        /// Holds the list of statements being executed by this reader.
-        /// </summary>
-        List<NpgsqlStatement> _statements = default!;
 
         /// <summary>
         /// The index of the current query resultset we're processing (within a multiquery)
@@ -93,23 +82,6 @@ namespace Npgsql
 
         int _charPos;
 
-        /// <summary>
-        /// The RowDescription message for the current resultset being processed
-        /// </summary>
-        internal RowDescriptionMessage? RowDescription;
-
-        ulong? _recordsAffected;
-
-        /// <summary>
-        /// Whether the current result set has rows
-        /// </summary>
-        bool _hasRows;
-
-        /// <summary>
-        /// Is raised whenever Close() is called.
-        /// </summary>
-        public override event EventHandler? ReaderClosed;
-
         bool _isSchemaOnly;
         bool _isSequential;
 
@@ -125,10 +97,7 @@ namespace Npgsql
 
         static readonly NpgsqlLogger Log = NpgsqlLogManager.CreateLogger(nameof(NpgsqlStandardDataReader));
 
-        internal NpgsqlStandardDataReader(NpgsqlConnector connector)
-        {
-            Connector = connector;
-        }
+        internal NpgsqlStandardDataReader(NpgsqlConnector connector) : base(connector) { }
 
         internal void Init(NpgsqlCommand command, CommandBehavior behavior, List<NpgsqlStatement> statements, Task sendTask)
         {
@@ -148,64 +117,30 @@ namespace Npgsql
         #region Read
 
         /// <summary>
-        /// Advances the reader to the next record in a result set.
+        /// This is an optimized execution path that avoids calling any async methods for the (usual)
+        /// case where the next row (or CommandComplete) is already in memory.
         /// </summary>
-        /// <returns><b>true</b> if there are more rows; otherwise <b>false</b>.</returns>
-        /// <remarks>
-        /// The default position of a data reader is before the first record. Therefore, you must call Read to begin accessing data.
-        /// </remarks>
-        public override bool Read()
+        /// <returns></returns>
+        internal override bool? TryFastRead()
         {
-            CheckClosed();
-            var fastRead = TryFastRead();
-            return fastRead.HasValue
-                ? fastRead.Value
-                : Read(false).GetAwaiter().GetResult();
-        }
-
-        /// <summary>
-        /// This is the asynchronous version of <see cref="Read()"/> The cancellation token is currently ignored.
-        /// </summary>
-        /// <param name="cancellationToken">The token to monitor for cancellation requests.</param>
-        /// <returns>A task representing the asynchronous operation.</returns>
-        public override Task<bool> ReadAsync(CancellationToken cancellationToken)
-        {
-            CheckClosed();
-
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<bool>(cancellationToken);
-
-            var fastRead = TryFastRead();
-            if (fastRead.HasValue)
-                return fastRead.Value ? PGUtil.TrueTask : PGUtil.FalseTask;
-
-            using (NoSynchronizationContextScope.Enter())
-                return Read(true);
-        }
-
-        bool? TryFastRead()
-        {
-            // This is an optimized execution path that avoids calling any async methods for the (usual)
-            // case where the next row (or CommandComplete) is already in memory.
-
             if (_behavior.HasFlag(CommandBehavior.SingleRow))
                 return null;
 
             switch (State)
             {
-            case ReaderState.BeforeResult:
-                // First Read() after NextResult. Data row has already been processed.
-                State = ReaderState.InResult;
-                return true;
-            case ReaderState.InResult:
-                if (_isSequential)
-                    return null;
-                ConsumeRowNonSequential();
-                break;
-            case ReaderState.BetweenResults:
-            case ReaderState.Consumed:
-            case ReaderState.Closed:
-                return false;
+                case ReaderState.BeforeResult:
+                    // First Read() after NextResult. Data row has already been processed.
+                    State = ReaderState.InResult;
+                    return true;
+                case ReaderState.InResult:
+                    if (_isSequential)
+                        return null;
+                    ConsumeRowNonSequential();
+                    break;
+                case ReaderState.BetweenResults:
+                case ReaderState.Consumed:
+                case ReaderState.Closed:
+                    return false;
             }
 
             var readBuf = Connector.ReadBuffer;
@@ -225,31 +160,37 @@ namespace Npgsql
             return true;
         }
 
-        async Task<bool> Read(bool async)
+        /// <summary>
+        /// Internal implementation of Read The cancellation token is currently ignored.
+        /// </summary>
+        /// <param name="async"></param>
+        /// <param name="cancellationToken"></param>
+        /// <returns></returns>
+        protected override async Task<bool> Read(bool async, CancellationToken cancellationToken)
         {
             switch (State)
             {
-            case ReaderState.BeforeResult:
-                // First Read() after NextResult. Data row has already been processed.
-                State = ReaderState.InResult;
-                return true;
+                case ReaderState.BeforeResult:
+                    // First Read() after NextResult. Data row has already been processed.
+                    State = ReaderState.InResult;
+                    return true;
 
-            case ReaderState.InResult:
-                await ConsumeRow(async);
-                if (_behavior.HasFlag(CommandBehavior.SingleRow))
-                {
-                    // TODO: See optimization proposal in #410
-                    await Consume(async);
+                case ReaderState.InResult:
+                    await ConsumeRow(async);
+                    if (_behavior.HasFlag(CommandBehavior.SingleRow))
+                    {
+                        // TODO: See optimization proposal in #410
+                        await Consume(async);
+                        return false;
+                    }
+                    break;
+
+                case ReaderState.BetweenResults:
+                case ReaderState.Consumed:
+                case ReaderState.Closed:
                     return false;
-                }
-                break;
-
-            case ReaderState.BetweenResults:
-            case ReaderState.Consumed:
-            case ReaderState.Closed:
-                return false;
-            default:
-                throw new ArgumentOutOfRangeException();
+                default:
+                    throw new ArgumentOutOfRangeException();
             }
 
             try
@@ -334,7 +275,7 @@ namespace Npgsql
         /// Internal implementation of NextResult
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        async Task<bool> NextResult(bool async, bool isConsuming=false)
+        async Task<bool> NextResult(bool async, bool isConsuming = false)
         {
             CheckClosed();
 
@@ -344,35 +285,35 @@ namespace Npgsql
             // If we're in the middle of a resultset, consume it
             switch (State)
             {
-            case ReaderState.BeforeResult:
-            case ReaderState.InResult:
-                await ConsumeRow(async);
-                while (true)
-                {
-                    var completedMsg = await Connector.ReadMessage(async, DataRowLoadingMode.Skip);
-                    switch (completedMsg.Code)
+                case ReaderState.BeforeResult:
+                case ReaderState.InResult:
+                    await ConsumeRow(async);
+                    while (true)
                     {
-                    case BackendMessageCode.CompletedResponse:
-                    case BackendMessageCode.EmptyQueryResponse:
-                        ProcessMessage(completedMsg);
+                        var completedMsg = await Connector.ReadMessage(async, DataRowLoadingMode.Skip);
+                        switch (completedMsg.Code)
+                        {
+                            case BackendMessageCode.CompletedResponse:
+                            case BackendMessageCode.EmptyQueryResponse:
+                                ProcessMessage(completedMsg);
+                                break;
+                            default:
+                                continue;
+                        }
+
                         break;
-                    default:
-                        continue;
                     }
 
                     break;
-                }
 
-                break;
+                case ReaderState.BetweenResults:
+                    break;
 
-            case ReaderState.BetweenResults:
-                break;
-
-            case ReaderState.Consumed:
-            case ReaderState.Closed:
-                return false;
-            default:
-                throw new ArgumentOutOfRangeException();
+                case ReaderState.Consumed:
+                case ReaderState.Closed:
+                    return false;
+                default:
+                    throw new ArgumentOutOfRangeException();
             }
 
             Debug.Assert(State == ReaderState.BetweenResults);
@@ -448,11 +389,11 @@ namespace Npgsql
                     msg = await ReadMessage(async);
                     switch (msg.Code)
                     {
-                    case BackendMessageCode.CompletedResponse:
-                    case BackendMessageCode.EmptyQueryResponse:
-                        break;
-                    default:
-                        throw Connector.UnexpectedMessageReceived(msg.Code);
+                        case BackendMessageCode.CompletedResponse:
+                        case BackendMessageCode.EmptyQueryResponse:
+                            break;
+                        default:
+                            throw Connector.UnexpectedMessageReceived(msg.Code);
                     }
 
                     ProcessMessage(msg);
@@ -477,11 +418,11 @@ namespace Npgsql
 
                 switch (msg.Code)
                 {
-                case BackendMessageCode.DataRow:
-                case BackendMessageCode.CompletedResponse:
-                    break;
-                default:
-                    throw Connector.UnexpectedMessageReceived(msg.Code);
+                    case BackendMessageCode.DataRow:
+                    case BackendMessageCode.CompletedResponse:
+                        break;
+                    default:
+                        throw Connector.UnexpectedMessageReceived(msg.Code);
                 }
 
                 return true;
@@ -556,16 +497,16 @@ namespace Npgsql
                     var msg = await Connector.ReadMessage(async);
                     switch (msg.Code)
                     {
-                    case BackendMessageCode.NoData:
-                        RowDescription = _statements[StatementIndex].Description = null;
-                        break;
-                    case BackendMessageCode.RowDescription:
-                        // We have a resultset
-                        RowDescription = _statements[StatementIndex].Description = (RowDescriptionMessage)msg;
-                        Command.FixupRowDescription(RowDescription, StatementIndex == 0);
-                        break;
-                    default:
-                        throw Connector.UnexpectedMessageReceived(msg.Code);
+                        case BackendMessageCode.NoData:
+                            RowDescription = _statements[StatementIndex].Description = null;
+                            break;
+                        case BackendMessageCode.RowDescription:
+                            // We have a resultset
+                            RowDescription = _statements[StatementIndex].Description = (RowDescriptionMessage)msg;
+                            Command.FixupRowDescription(RowDescription, StatementIndex == 0);
+                            break;
+                        default:
+                            throw Connector.UnexpectedMessageReceived(msg.Code);
                     }
                 }
 
@@ -591,38 +532,38 @@ namespace Npgsql
         {
             switch (msg.Code)
             {
-            case BackendMessageCode.DataRow:
-                ProcessDataRowMessage((DataRowMessage)msg);
-                return;
+                case BackendMessageCode.DataRow:
+                    ProcessDataRowMessage((DataRowMessage)msg);
+                    return;
 
-            case BackendMessageCode.CompletedResponse:
-                var completed = (CommandCompleteMessage)msg;
-                switch (completed.StatementType)
-                {
-                case StatementType.Update:
-                case StatementType.Insert:
-                case StatementType.Delete:
-                case StatementType.Copy:
-                case StatementType.Move:
-                    if (!_recordsAffected.HasValue)
-                        _recordsAffected = 0;
-                    _recordsAffected += completed.Rows;
-                    break;
-                }
+                case BackendMessageCode.CompletedResponse:
+                    var completed = (CommandCompleteMessage)msg;
+                    switch (completed.StatementType)
+                    {
+                        case StatementType.Update:
+                        case StatementType.Insert:
+                        case StatementType.Delete:
+                        case StatementType.Copy:
+                        case StatementType.Move:
+                            if (!_recordsAffected.HasValue)
+                                _recordsAffected = 0;
+                            _recordsAffected += completed.Rows;
+                            break;
+                    }
 
-                _statements[StatementIndex].ApplyCommandComplete(completed);
-                goto case BackendMessageCode.EmptyQueryResponse;
+                    _statements[StatementIndex].ApplyCommandComplete(completed);
+                    goto case BackendMessageCode.EmptyQueryResponse;
 
-            case BackendMessageCode.EmptyQueryResponse:
-                State = ReaderState.BetweenResults;
-                return;
+                case BackendMessageCode.EmptyQueryResponse:
+                    State = ReaderState.BetweenResults;
+                    return;
 
-            case BackendMessageCode.ReadyForQuery:
-                State = ReaderState.Consumed;
-                return;
+                case BackendMessageCode.ReadyForQuery:
+                    State = ReaderState.Consumed;
+                    return;
 
-            default:
-                throw new Exception("Received unexpected backend message of type " + msg.Code);
+                default:
+                    throw new Exception("Received unexpected backend message of type " + msg.Code);
             }
         }
 
@@ -660,84 +601,20 @@ namespace Npgsql
 
             switch (State)
             {
-            case ReaderState.BetweenResults:
-                State = ReaderState.BeforeResult;
-                break;
-            case ReaderState.BeforeResult:
-                State = ReaderState.InResult;
-                break;
-            case ReaderState.InResult:
-                break;
-            default:
-                throw Connector.UnexpectedMessageReceived(BackendMessageCode.DataRow);
+                case ReaderState.BetweenResults:
+                    State = ReaderState.BeforeResult;
+                    break;
+                case ReaderState.BeforeResult:
+                    State = ReaderState.InResult;
+                    break;
+                case ReaderState.InResult:
+                    break;
+                default:
+                    throw Connector.UnexpectedMessageReceived(BackendMessageCode.DataRow);
             }
         }
 
         #endregion
-
-        /// <summary>
-        /// Gets a value indicating the depth of nesting for the current row.  Always returns zero.
-        /// </summary>
-        public override int Depth => 0;
-
-        /// <summary>
-        /// Gets a value indicating whether the data reader is closed.
-        /// </summary>
-        public override bool IsClosed => State == ReaderState.Closed;
-
-        /// <summary>
-        /// Gets the number of rows changed, inserted, or deleted by execution of the SQL statement.
-        /// </summary>
-        public override int RecordsAffected => _recordsAffected.HasValue ? (int)_recordsAffected.Value : -1;
-
-        /// <summary>
-        /// Returns details about each statement that this reader will or has executed.
-        /// </summary>
-        /// <remarks>
-        /// Note that some fields (i.e. rows and oid) are only populated as the reader
-        /// traverses the result.
-        ///
-        /// For commands with multiple queries, this exposes the number of rows affected on
-        /// a statement-by-statement basis, unlike <see cref="DbDataReader.RecordsAffected"/>
-        /// which exposes an aggregation across all statements.
-        /// </remarks>
-        public override IReadOnlyList<NpgsqlStatement> Statements => _statements.AsReadOnly();
-
-        /// <summary>
-        /// Gets a value that indicates whether this DbDataReader contains one or more rows.
-        /// </summary>
-        public override bool HasRows => State == ReaderState.Closed
-            ? throw new InvalidOperationException("Invalid attempt to call HasRows when reader is closed.")
-            : _hasRows;
-
-        /// <summary>
-        /// Indicates whether the reader is currently positioned on a row, i.e. whether reading a
-        /// column is possible.
-        /// This property is different from <see cref="HasRows"/> in that <see cref="HasRows"/> will
-        /// return true even if attempting to read a column will fail, e.g. before <see cref="Read()"/>
-        /// has been called
-        /// </summary>
-        [PublicAPI]
-        public override bool IsOnRow => State == ReaderState.InResult;
-
-        /// <summary>
-        /// Gets the name of the column, given the zero-based column ordinal.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The name of the specified column.</returns>
-        public override string GetName(int ordinal) => CheckRowDescriptionAndGetField(ordinal).Name;
-
-        /// <summary>
-        /// Gets the number of columns in the current row.
-        /// </summary>
-        public override int FieldCount
-        {
-            get
-            {
-                CheckClosed();
-                return RowDescription?.NumFields ?? 0;
-            }
-        }
 
         #region Cleanup / Dispose
 
@@ -745,41 +622,17 @@ namespace Npgsql
         /// Consumes all result sets for this reader, leaving the connector ready for sending and processing further
         /// queries
         /// </summary>
-        async Task Consume(bool async)
+        protected override async Task Consume(bool async)
         {
             // Skip over the other result sets. Note that this does tally records affected
             // from CommandComplete messages, and properly sets state for auto-prepared statements
             if (_isSchemaOnly)
-                while (await NextResultSchemaOnly(async)) {}
+                while (await NextResultSchemaOnly(async)) { }
             else
-                while (await NextResult(async, true)) {}
+                while (await NextResult(async, true)) { }
         }
 
-        internal override async Task Close(bool connectionClosing, bool async)
-        {
-            if (State == ReaderState.Closed)
-                return;
-
-            switch (Connector.State)
-            {
-            case ConnectorState.Broken:
-            case ConnectorState.Closed:
-                // This may have happen because an I/O error while reading a value, or some non-safe
-                // exception thrown from a type handler. Or if the connection was closed while the reader
-                // was still open
-                State = ReaderState.Closed;
-                Command.State = CommandState.Idle;
-                ReaderClosed?.Invoke(this, EventArgs.Empty);
-                return;
-            }
-
-            if (State != ReaderState.Consumed)
-                await Consume(async);
-
-            await Cleanup(async, connectionClosing);
-        }
-
-        internal override async Task Cleanup(bool async, bool connectionClosing=false)
+        internal override async Task _Cleanup(bool async, bool connectionClosing = false)
         {
             Log.Trace("Cleaning up reader", Connector.Id);
 
@@ -800,191 +653,7 @@ namespace Npgsql
             // the reader's CommandBehavior.CloseConnection
             if (_behavior.HasFlag(CommandBehavior.CloseConnection) && !connectionClosing)
                 _connection.Close();
-
-            if (ReaderClosed != null)
-            {
-                ReaderClosed(this, EventArgs.Empty);
-                ReaderClosed = null;
-            }
         }
-
-        #endregion
-
-        #region Simple value getters
-
-        /// <summary>
-        /// Gets the value of the specified column as a Boolean.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override bool GetBoolean(int ordinal) => GetFieldValue<bool>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a byte.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override byte GetByte(int ordinal) => GetFieldValue<byte>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a single character.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override char GetChar(int ordinal) => GetFieldValue<char>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a 16-bit signed integer.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override short GetInt16(int ordinal) => GetFieldValue<short>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a 32-bit signed integer.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override int GetInt32(int ordinal) => GetFieldValue<int>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a 64-bit signed integer.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override long GetInt64(int ordinal) => GetFieldValue<long>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a <see cref="DateTime"/> object.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override DateTime GetDateTime(int ordinal) => GetFieldValue<DateTime>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as an instance of <see cref="string"/>.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override string GetString(int ordinal) => GetFieldValue<string>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a <see cref="decimal"/> object.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override decimal GetDecimal(int ordinal) => GetFieldValue<decimal>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a double-precision floating point number.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override double GetDouble(int ordinal) => GetFieldValue<double>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a single-precision floating point number.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override float GetFloat(int ordinal) => GetFieldValue<float>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a globally-unique identifier (GUID).
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override Guid GetGuid(int ordinal) => GetFieldValue<Guid>(ordinal);
-
-        /// <summary>
-        /// Populates an array of objects with the column values of the current row.
-        /// </summary>
-        /// <param name="values">An array of Object into which to copy the attribute columns.</param>
-        /// <returns>The number of instances of <see cref="object"/> in the array.</returns>
-        public override int GetValues(object[] values)
-        {
-            if (values == null)
-                throw new ArgumentNullException(nameof(values));
-            CheckResultSet();
-
-            var count = Math.Min(FieldCount, values.Length);
-            for (var i = 0; i < count; i++)
-                values[i] = GetValue(i);
-            return count;
-        }
-
-        /// <summary>
-        /// Gets the value of the specified column as an instance of <see cref="object"/>.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override object this[int ordinal] => GetValue(ordinal);
-
-        #endregion
-
-        #region Provider-specific simple type getters
-
-        /// <summary>
-        /// Gets the value of the specified column as an <see cref="NpgsqlDate"/>,
-        /// Npgsql's provider-specific type for dates.
-        /// </summary>
-        /// <remarks>
-        /// PostgreSQL's date type represents dates from 4713 BC to 5874897 AD, while .NET's DateTime
-        /// only supports years from 1 to 1999. If you require years outside this range use this accessor.
-        /// The standard <see cref="DbDataReader.GetProviderSpecificValue"/> method will also return this type, but has
-        /// the disadvantage of boxing the value.
-        /// See http://www.postgresql.org/docs/current/static/datatype-datetime.html
-        /// </remarks>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override NpgsqlDate GetDate(int ordinal) => GetFieldValue<NpgsqlDate>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as a TimeSpan,
-        /// </summary>
-        /// <remarks>
-        /// PostgreSQL's interval type has has a resolution of 1 microsecond and ranges from
-        /// -178000000 to 178000000 years, while .NET's TimeSpan has a resolution of 100 nanoseconds
-        /// and ranges from roughly -29247 to 29247 years.
-        /// See http://www.postgresql.org/docs/current/static/datatype-datetime.html
-        /// </remarks>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override TimeSpan GetTimeSpan(int ordinal) => GetFieldValue<TimeSpan>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as an <see cref="NpgsqlTimeSpan"/>,
-        /// Npgsql's provider-specific type for time spans.
-        /// </summary>
-        /// <remarks>
-        /// PostgreSQL's interval type has has a resolution of 1 microsecond and ranges from
-        /// -178000000 to 178000000 years, while .NET's TimeSpan has a resolution of 100 nanoseconds
-        /// and ranges from roughly -29247 to 29247 years. If you require values from outside TimeSpan's
-        /// range use this accessor.
-        /// The standard ADO.NET <see cref="DbDataReader.GetProviderSpecificValue"/> method will also return this
-        /// type, but has the disadvantage of boxing the value.
-        /// See http://www.postgresql.org/docs/current/static/datatype-datetime.html
-        /// </remarks>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override NpgsqlTimeSpan GetInterval(int ordinal) => GetFieldValue<NpgsqlTimeSpan>(ordinal);
-
-        /// <summary>
-        /// Gets the value of the specified column as an <see cref="NpgsqlDateTime"/>,
-        /// Npgsql's provider-specific type for date/time timestamps. Note that this type covers
-        /// both PostgreSQL's "timestamp with time zone" and "timestamp without time zone" types,
-        /// which differ only in how they are converted upon input/output.
-        /// </summary>
-        /// <remarks>
-        /// PostgreSQL's timestamp type represents dates from 4713 BC to 5874897 AD, while .NET's DateTime
-        /// only supports years from 1 to 1999. If you require years outside this range use this accessor.
-        /// The standard <see cref="DbDataReader.GetProviderSpecificValue"/> method will also return this type, but has
-        /// the disadvantage of boxing the value.
-        /// See http://www.postgresql.org/docs/current/static/datatype-datetime.html
-        /// </remarks>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override NpgsqlDateTime GetTimeStamp(int ordinal) => GetFieldValue<NpgsqlDateTime>(ordinal);
 
         #endregion
 
@@ -1040,36 +709,12 @@ namespace Npgsql
         }
 
         /// <summary>
-        /// Retrieves data as a <see cref="Stream"/>.
+        /// Internal implementation of GetStream
         /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The returned object.</returns>
-        public override Stream GetStream(int ordinal) => GetStream(ordinal, false).Result;
-
-        /// <summary>
-        /// Retrieves data as a <see cref="Stream"/>.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <param name="cancellationToken">The token to monitor for cancellation requests. The default value is <see cref="CancellationToken.None"/>.</param>
-        /// <returns>The returned object.</returns>
-        public override Task<Stream> GetStreamAsync(int ordinal, CancellationToken cancellationToken = default)
-        {
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<Stream>(cancellationToken);
-            using (NoSynchronizationContextScope.Enter())
-                return GetStream(ordinal, true).AsTask();
-        }
-
-        ValueTask<Stream> GetStream(int ordinal, bool async)
-        {
-            var fieldDescription = CheckRowAndGetField(ordinal);
-            if (!(fieldDescription.Handler is ByteaHandler))
-                throw new InvalidCastException($"GetStream() not supported for type {fieldDescription.Handler.PgDisplayName}");
-
-            return GetStreamInternal(ordinal, async);
-        }
-
-        ValueTask<Stream> GetStreamInternal(int ordinal, bool async)
+        /// <param name="ordinal"></param>
+        /// <param name="async"></param>
+        /// <returns></returns>
+        internal override ValueTask<Stream> GetStreamInternal(int ordinal, bool async)
         {
             if (_columnStream != null && !_columnStream.IsDisposed)
                 throw new InvalidOperationException("A stream is already open for this reader");
@@ -1209,41 +854,6 @@ namespace Npgsql
             return (bytesSkipped, charsSkipped);
         }
 
-        /// <summary>
-        /// Retrieves data as a <see cref="TextReader"/>.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The returned object.</returns>
-        public override TextReader GetTextReader(int ordinal)
-            => GetTextReader(ordinal, false).Result;
-
-        /// <summary>
-        /// Retrieves data as a <see cref="TextReader"/>.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <param name="cancellationToken">The token to monitor for cancellation requests. The default value is <see cref="CancellationToken.None"/>.</param>
-        /// <returns>The returned object.</returns>
-        public override Task<TextReader> GetTextReaderAsync(int ordinal, CancellationToken cancellationToken = default)
-        {
-            if (cancellationToken.IsCancellationRequested)
-                return Task.FromCanceled<TextReader>(cancellationToken);
-            using (NoSynchronizationContextScope.Enter())
-                return GetTextReader(ordinal, true).AsTask();
-        }
-
-        async ValueTask<TextReader> GetTextReader(int ordinal, bool async)
-        {
-            var fieldDescription = CheckRowAndGetField(ordinal);
-            if (!(fieldDescription.Handler is ITextReaderHandler handler))
-                throw new InvalidCastException($"GetTextReader() not supported for type {fieldDescription.Handler.PgDisplayName}");
-
-            var stream = async
-                ? await GetStreamInternal(ordinal, async)
-                : GetStreamInternal(ordinal, async).Result;
-
-            return handler.GetTextReader(stream);
-        }
-
         #endregion
 
         #region GetFieldValue
@@ -1377,10 +987,12 @@ namespace Npgsql
         {
             var fieldDescription = CheckRowAndGetField(ordinal);
 
-            if (_isSequential) {
+            if (_isSequential)
+            {
                 SeekToColumnSequential(ordinal, false).GetAwaiter().GetResult();
                 CheckColumnStart();
-            } else
+            }
+            else
                 SeekToColumnNonSequential(ordinal);
 
             if (ColumnLen == -1)
@@ -1462,13 +1074,6 @@ namespace Npgsql
             }
         }
 
-        /// <summary>
-        /// Gets the value of the specified column as an instance of <see cref="object"/>.
-        /// </summary>
-        /// <param name="name">The name of the column.</param>
-        /// <returns>The value of the specified column.</returns>
-        public override object this[string name] => GetValue(GetOrdinal(name));
-
         #endregion
 
         #region IsDBNull
@@ -1517,93 +1122,6 @@ namespace Npgsql
         #region Other public accessors
 
         /// <summary>
-        /// Gets the column ordinal given the name of the column.
-        /// </summary>
-        /// <param name="name">The name of the column.</param>
-        /// <returns>The zero-based column ordinal.</returns>
-        public override int GetOrdinal(string name)
-        {
-            if (string.IsNullOrEmpty(name))
-                throw new ArgumentException("name cannot be empty", nameof(name));
-            if (State == ReaderState.Closed)
-                throw new InvalidOperationException("The reader is closed");
-            if (RowDescription is null)
-                throw new InvalidOperationException("No resultset is currently being traversed");
-            return RowDescription.GetFieldIndex(name);
-        }
-
-        /// <summary>
-        /// Gets a representation of the PostgreSQL data type for the specified field.
-        /// The returned representation can be used to access various information about the field.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column index.</param>
-        [PublicAPI]
-        public override PostgresType GetPostgresType(int ordinal) => CheckRowDescriptionAndGetField(ordinal).PostgresType;
-
-        /// <summary>
-        /// Gets the data type information for the specified field.
-        /// This will be the PostgreSQL type name (e.g. double precision), not the .NET type
-        /// (see <see cref="GetFieldType"/> for that).
-        /// </summary>
-        /// <param name="ordinal">The zero-based column index.</param>
-        public override string GetDataTypeName(int ordinal) => CheckRowDescriptionAndGetField(ordinal).TypeDisplayName;
-
-        /// <summary>
-        /// Gets the OID for the PostgreSQL type for the specified field, as it appears in the pg_type table.
-        /// </summary>
-        /// <remarks>
-        /// This is a PostgreSQL-internal value that should not be relied upon and should only be used for
-        /// debugging purposes.
-        /// </remarks>
-        /// <param name="ordinal">The zero-based column index.</param>
-        public override uint GetDataTypeOID(int ordinal) => CheckRowDescriptionAndGetField(ordinal).TypeOID;
-
-        /// <summary>
-        /// Gets the data type of the specified column.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The data type of the specified column.</returns>
-        public override Type GetFieldType(int ordinal)
-            => Command.ObjectResultTypes?[ordinal]
-               ?? CheckRowDescriptionAndGetField(ordinal).FieldType;
-
-        /// <summary>
-        /// Returns the provider-specific field type of the specified column.
-        /// </summary>
-        /// <param name="ordinal">The zero-based column ordinal.</param>
-        /// <returns>The Type object that describes the data type of the specified column.</returns>
-        public override Type GetProviderSpecificFieldType(int ordinal)
-        {
-            var fieldDescription = CheckRowDescriptionAndGetField(ordinal);
-            return fieldDescription.Handler.GetProviderSpecificFieldType(fieldDescription);
-        }
-
-        /// <summary>
-        /// Gets all provider-specific attribute columns in the collection for the current row.
-        /// </summary>
-        /// <param name="values">An array of Object into which to copy the attribute columns.</param>
-        /// <returns>The number of instances of <see cref="object"/> in the array.</returns>
-        public override int GetProviderSpecificValues(object[] values)
-        {
-            if (values == null)
-                throw new ArgumentNullException(nameof(values));
-            if (State != ReaderState.InResult)
-                throw new InvalidOperationException("No row is available");
-
-            var count = Math.Min(FieldCount, values.Length);
-            for (var i = 0; i < count; i++)
-                values[i] = GetProviderSpecificValue(i);
-            return count;
-        }
-
-        /// <summary>
-        /// Returns an <see cref="IEnumerator"/> that can be used to iterate through the rows in the data reader.
-        /// </summary>
-        /// <returns>An <see cref="IEnumerator"/> that can be used to iterate through the rows in the data reader.</returns>
-        public override IEnumerator GetEnumerator()
-            => new DbEnumerator(this);
-
-        /// <summary>
         /// Returns schema information for the columns in the current resultset.
         /// </summary>
         /// <returns></returns>
@@ -1613,91 +1131,7 @@ namespace Npgsql
                 : new DbColumnSchemaGenerator(_connection, RowDescription, _behavior.HasFlag(CommandBehavior.KeyInfo))
                     .GetColumnSchema();
 
-#if !NET461
-        ReadOnlyCollection<DbColumn> IDbColumnSchemaGenerator.GetColumnSchema()
-            => new ReadOnlyCollection<DbColumn>(GetColumnSchema().Cast<DbColumn>().ToList());
-#endif
-
         #endregion
-
-        #region Schema metadata table
-
-
-        /// <summary>
-        /// Returns a System.Data.DataTable that describes the column metadata of the DataReader.
-        /// </summary>
-#nullable disable
-        public override DataTable GetSchemaTable()
-#nullable restore
-        {
-            if (FieldCount == 0) // No resultset
-                return null;
-
-            var table = new DataTable("SchemaTable");
-
-            // Note: column order is important to match SqlClient's, some ADO.NET users appear
-            // to assume ordering (see #1671)
-            table.Columns.Add("ColumnName", typeof(string));
-            table.Columns.Add("ColumnOrdinal", typeof(int));
-            table.Columns.Add("ColumnSize", typeof(int));
-            table.Columns.Add("NumericPrecision", typeof(int));
-            table.Columns.Add("NumericScale", typeof(int));
-            table.Columns.Add("IsUnique", typeof(bool));
-            table.Columns.Add("IsKey", typeof(bool));
-            table.Columns.Add("BaseServerName", typeof(string));
-            table.Columns.Add("BaseCatalogName", typeof(string));
-            table.Columns.Add("BaseColumnName", typeof(string));
-            table.Columns.Add("BaseSchemaName", typeof(string));
-            table.Columns.Add("BaseTableName", typeof(string));
-            table.Columns.Add("DataType", typeof(Type));
-            table.Columns.Add("AllowDBNull", typeof(bool));
-            table.Columns.Add("ProviderType", typeof(int));
-            table.Columns.Add("IsAliased", typeof(bool));
-            table.Columns.Add("IsExpression", typeof(bool));
-            table.Columns.Add("IsIdentity", typeof(bool));
-            table.Columns.Add("IsAutoIncrement", typeof(bool));
-            table.Columns.Add("IsRowVersion", typeof(bool));
-            table.Columns.Add("IsHidden", typeof(bool));
-            table.Columns.Add("IsLong", typeof(bool));
-            table.Columns.Add("IsReadOnly", typeof(bool));
-            table.Columns.Add("ProviderSpecificDataType", typeof(Type));
-            table.Columns.Add("DataTypeName", typeof(string));
-
-            foreach (var column in GetColumnSchema())
-            {
-                var row = table.NewRow();
-
-                row["ColumnName"] = column.ColumnName;
-                row["ColumnOrdinal"] = column.ColumnOrdinal ?? -1;
-                row["ColumnSize"] = column.ColumnSize ?? -1;
-                row["NumericPrecision"] = column.NumericPrecision ?? 0;
-                row["NumericScale"] = column.NumericScale ?? 0;
-                row["IsUnique"] = column.IsUnique == true;
-                row["IsKey"] = column.IsKey == true;
-                row["BaseServerName"] = "";
-                row["BaseCatalogName"] = column.BaseCatalogName;
-                row["BaseColumnName"] = column.BaseColumnName;
-                row["BaseSchemaName"] = column.BaseSchemaName;
-                row["BaseTableName"] = column.BaseTableName;
-                row["DataType"] = column.DataType;
-                row["AllowDBNull"] = (object?)column.AllowDBNull ?? DBNull.Value;
-                row["ProviderType"] = column.NpgsqlDbType ?? NpgsqlDbType.Unknown;
-                row["IsAliased"] = column.IsAliased == true;
-                row["IsExpression"] = column.IsExpression == true;
-                row["IsIdentity"] = column.IsIdentity == true;
-                row["IsAutoIncrement"] = column.IsAutoIncrement == true;
-                row["IsRowVersion"] = false;
-                row["IsHidden"] = column.IsHidden == true;
-                row["IsLong"] = column.IsLong == true;
-                row["DataTypeName"] = column.DataTypeName;
-
-                table.Rows.Add(row);
-            }
-
-            return table;
-        }
-
-        #endregion Schema metadata table
 
         #region Seeking
 
@@ -1721,7 +1155,7 @@ namespace Npgsql
             for (var lastColumnRead = _columns.Count; column >= lastColumnRead; lastColumnRead++)
             {
                 int lastColumnLen;
-                (Buffer.ReadPosition, lastColumnLen) = _columns[lastColumnRead-1];
+                (Buffer.ReadPosition, lastColumnLen) = _columns[lastColumnRead - 1];
                 if (lastColumnLen != -1)
                     Buffer.ReadPosition += lastColumnLen;
                 var len = Buffer.ReadInt32();
@@ -1869,56 +1303,6 @@ namespace Npgsql
         #region Checks
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void CheckResultSet()
-        {
-            switch (State)
-            {
-            case ReaderState.BeforeResult:
-            case ReaderState.InResult:
-                break;
-            case ReaderState.Closed:
-                throw new InvalidOperationException("The reader is closed");
-            default:
-                throw new InvalidOperationException("No resultset is currently being traversed");
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        FieldDescription CheckRowAndGetField(int column)
-        {
-            switch (State)
-            {
-            case ReaderState.InResult:
-                break;
-            case ReaderState.Closed:
-                throw new InvalidOperationException("The reader is closed");
-            default:
-                throw new InvalidOperationException("No row is available");
-            }
-
-            if (column < 0 || column >= RowDescription!.NumFields)
-                throw new IndexOutOfRangeException($"Column must be between {0} and {RowDescription!.NumFields - 1}");
-
-            return RowDescription[column];
-        }
-
-        /// <summary>
-        /// Checks that we have a RowDescription, but not necessary an actual resultset
-        /// (for operations which work in SchemaOnly mode.
-        /// </summary>
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        FieldDescription CheckRowDescriptionAndGetField(int column)
-        {
-            if (RowDescription == null)
-                throw new InvalidOperationException("No resultset is currently being traversed");
-
-            if (column < 0 || column >= RowDescription.NumFields)
-                throw new IndexOutOfRangeException($"Column must be between {0} and {RowDescription.NumFields - 1}");
-
-            return RowDescription[column];
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         void CheckColumnStart()
         {
             Debug.Assert(_isSequential);
@@ -1926,22 +1310,6 @@ namespace Npgsql
                 throw new InvalidOperationException("Attempt to read a position in the column which has already been read");
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        void CheckClosed()
-        {
-            if (State == ReaderState.Closed)
-                throw new InvalidOperationException("The reader is closed");
-        }
-
         #endregion
-    }
-
-    enum ReaderState
-    {
-        BeforeResult,
-        InResult,
-        BetweenResults,
-        Consumed,
-        Closed,
     }
 }
